@@ -154,6 +154,7 @@ int main(int argc, char** argv)
         config->ip.get().c_str(),
         config->ice.udpPortRangeLow.get(),
         config->ice.udpPortRangeHigh.get());
+    logger::logAlways("video codec %s", "main", config->codec.videoCodec.get().c_str());
     logger::logAlways("log level %s", "main", config->logLevel.get().c_str());
 
     {
