@@ -91,6 +91,7 @@ public:
         const std::vector<uint32_t>& audioSsrcs,
         const std::vector<api::SimulcastGroup>& videoSsrcs,
         const uint32_t lastN);
+
     ~EngineMixer() override;
 
     const std::string& getId() const { return _id; }
@@ -233,7 +234,8 @@ public: // private but called from helper method
     void removeStream(const EngineAudioStream* engineAudioStream);
     void removeStream(const EngineDataStream* engineDataStream);
 
-private:
+    // Protected for testing (EngineMixerSpy)
+protected:
     static const size_t maxPendingPackets = 8192;
     static const size_t maxPendingRtcpPackets = 2048;
     static const size_t maxSsrcs = 8192;
@@ -386,8 +388,12 @@ private:
     memory::PacketPoolAllocator& _sendAllocator;
     memory::AudioPacketPoolAllocator& _audioAllocator;
 
+    // Useful to avoid get time when a precise time is not needed and we can rely on last/current iteration start time
+    uint64_t _lastStartedIterationTimestamp;
+
     uint64_t _lastReceiveTimeOnRegularTransports;
     uint64_t _lastReceiveTimeOnBarbellTransports;
+    uint64_t _lastSendTimeOfUserMediaMapMessageOverBarbells;
     std::atomic_flag _iceReceivedOnRegularTransport = ATOMIC_FLAG_INIT;
     std::atomic_flag _iceReceivedOnBarbellTransport = ATOMIC_FLAG_INIT;
     uint64_t _lastCounterCheck;
@@ -465,6 +471,7 @@ private:
     void sendUserMediaMapMessage(const size_t endpointIdHash);
     void sendUserMediaMapMessageToAll();
     void sendUserMediaMapMessageOverBarbells();
+    void sendPeriodicUserMediaMapMessageOverBarbells(const uint64_t engineIterationStartTimestamp);
     void sendDominantSpeakerToRecordingStream(EngineRecordingStream& recordingStream,
         const size_t dominantSpeaker,
         const std::string& dominantSpeakerEndpoint);
@@ -519,6 +526,11 @@ private:
         memory::UniquePacket packet,
         const uint32_t extendedSequenceNumber,
         const uint64_t timestamp);
+    void onAudioTelephoneEventRtpPacketReceived(SsrcInboundContext& ssrcContext,
+        transport::RtcTransport* sender,
+        memory::UniquePacket packet,
+        const uint32_t extendedSequenceNumber,
+        const uint64_t timestamp);
     void onVideoRtpPacketReceived(SsrcInboundContext& ssrcContext,
         transport::RtcTransport* sender,
         memory::UniquePacket packet,
@@ -542,11 +554,13 @@ private:
     SsrcOutboundContext* obtainOutboundSsrcContext(size_t endpointIdHash,
         concurrency::MpmcHashmap32<uint32_t, SsrcOutboundContext>& ssrcOutboundContexts,
         const uint32_t ssrc,
-        const RtpMap& rtpMap);
+        const RtpMap& rtpMap,
+        const RtpMap& telephoneEventRtpMap);
     SsrcOutboundContext* obtainOutboundForwardSsrcContext(size_t endpointIdHash,
         concurrency::MpmcHashmap32<uint32_t, SsrcOutboundContext>& ssrcOutboundContexts,
         const uint32_t ssrc,
-        const RtpMap& rtpMap);
+        const RtpMap& rtpMap,
+        const RtpMap& telephoneEventRtpMap);
 
     bool setPacketSourceEndpointIdHash(memory::Packet& packet, size_t barbellIdHash, uint32_t ssrc, bool isAudio);
     utils::Optional<uint32_t> findBarbellMainSsrc(size_t barbellIdHash, uint32_t feedbackSsrc);

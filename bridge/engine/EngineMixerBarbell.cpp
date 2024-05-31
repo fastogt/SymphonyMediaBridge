@@ -17,6 +17,85 @@
 namespace bridge
 {
 
+namespace
+{
+template <typename TMap>
+void copyToBarbellMapItemArray(utils::SimpleJsonArray& endpointArray, TMap& map)
+{
+    for (auto endpoint : endpointArray)
+    {
+        char endpointId[45];
+        endpoint["endpoint-id"].getString(endpointId);
+        const auto endpointIdHash = utils::hash<char*>{}(endpointId);
+        auto entryIt = map.emplace(endpointIdHash, endpointId);
+
+        auto& item = entryIt.first->second;
+        for (auto ssrc : endpoint["ssrcs"].getArray())
+        {
+            item.newSsrcs.push_back(ssrc.getInt<uint32_t>(0));
+        }
+
+        if (endpoint.exists("noise-level"))
+        {
+            item.noiseLevel = endpoint["noise-level"].getFloat(0.0);
+        }
+
+        if (endpoint.exists("level"))
+        {
+            item.noiseLevel = endpoint["level"].getFloat(0.0);
+        }
+
+        if (endpoint.exists("neighbours"))
+        {
+            for (auto neighbour : endpoint["neighbours"].getArray())
+            {
+                item.neighbours.push_back(neighbour.getInt<uint32_t>(0));
+            }
+        }
+    }
+}
+
+template <class T>
+void addToMap(EngineBarbell::VideoStream& stream, T& videoMapping)
+{
+    auto* m = videoMapping.getItem(stream.endpointIdHash.get());
+    if (!m)
+    {
+        auto entry = videoMapping.emplace(stream.endpointIdHash.get(), stream.endpointId.get().c_str());
+        if (!entry.second)
+        {
+            return;
+        }
+        m = &entry.first->second;
+    }
+
+    if (m)
+    {
+        m->oldSsrcs.push_back(stream.stream.getKeySsrc());
+    }
+}
+
+template <class T>
+void addToMap(EngineBarbell::AudioStream& stream, T& audioMapping)
+{
+    auto* m = audioMapping.getItem(stream.endpointIdHash.get());
+    if (!m)
+    {
+        auto entry = audioMapping.emplace(stream.endpointIdHash.get(), stream.endpointId.get().c_str());
+        if (!entry.second)
+        {
+            return;
+        }
+        m = &entry.first->second;
+    }
+
+    if (m)
+    {
+        m->oldSsrcs.push_back(stream.ssrc);
+    }
+}
+} // namespace
+
 void EngineMixer::addBarbell(EngineBarbell* barbell)
 {
     const auto idHash = barbell->transport.getEndpointIdHash();
@@ -111,84 +190,6 @@ void EngineMixer::checkBarbellPacketCounters(const uint64_t timestamp)
     }
 }
 
-namespace
-{
-template <typename TMap>
-void copyToBarbellMapItemArray(utils::SimpleJsonArray& endpointArray, TMap& map)
-{
-    for (auto endpoint : endpointArray)
-    {
-        char endpointId[45];
-        endpoint["endpoint-id"].getString(endpointId);
-        const auto endpointIdHash = utils::hash<char*>{}(endpointId);
-        auto entryIt = map.emplace(endpointIdHash, endpointId);
-
-        auto& item = entryIt.first->second;
-        for (auto ssrc : endpoint["ssrcs"].getArray())
-        {
-            item.newSsrcs.push_back(ssrc.getInt<uint32_t>(0));
-        }
-
-        if (endpoint.exists("noise-level"))
-        {
-            item.noiseLevel = endpoint["noise-level"].getFloat(0.0);
-        }
-
-        if (endpoint.exists("level"))
-        {
-            item.noiseLevel = endpoint["level"].getFloat(0.0);
-        }
-
-        if (endpoint.exists("neighbours"))
-        {
-            for (auto neighbour : endpoint["neighbours"].getArray())
-            {
-                item.neighbours.push_back(neighbour.getInt<uint32_t>(0));
-            }
-        }
-    }
-}
-
-template <class T>
-void addToMap(EngineBarbell::VideoStream& stream, T& videoMapping)
-{
-    auto* m = videoMapping.getItem(stream.endpointIdHash.get());
-    if (!m)
-    {
-        auto entry = videoMapping.emplace(stream.endpointIdHash.get(), stream.endpointId.get().c_str());
-        if (!entry.second)
-        {
-            return;
-        }
-        m = &entry.first->second;
-    }
-
-    if (m)
-    {
-        m->oldSsrcs.push_back(stream.stream.getKeySsrc());
-    }
-}
-
-template <class T>
-void addToMap(EngineBarbell::AudioStream& stream, T& audioMapping)
-{
-    auto* m = audioMapping.getItem(stream.endpointIdHash.get());
-    if (!m)
-    {
-        auto entry = audioMapping.emplace(stream.endpointIdHash.get(), stream.endpointId.get().c_str());
-        if (!entry.second)
-        {
-            return;
-        }
-        m = &entry.first->second;
-    }
-
-    if (m)
-    {
-        m->oldSsrcs.push_back(stream.ssrc);
-    }
-}
-} // namespace
 // This method must be executed on engine thread. UMM requests could go in another queue and processed
 // at start of tick.
 // There are three phases to update the endpoints and ssrc mappings in active media list
@@ -480,7 +481,8 @@ SsrcInboundContext* EngineMixer::emplaceBarbellInboundSsrcContext(const uint32_t
 
     if (barbell->audioSsrcMap.contains(ssrc))
     {
-        auto emplaceResult = _allSsrcInboundContexts.emplace(ssrc, ssrc, barbell->audioRtpMap, sender, timestamp);
+        auto emplaceResult =
+            _allSsrcInboundContexts.emplace(ssrc, ssrc, barbell->audioRtpMap, bridge::RtpMap::EMPTY, sender, timestamp);
 
         if (!emplaceResult.second && emplaceResult.first == _allSsrcInboundContexts.end())
         {
@@ -578,15 +580,21 @@ void EngineMixer::processIncomingBarbellFbRtcpPacket(EngineBarbell& barbell,
     _activeMediaList->getFeedbackSsrc(mediaSsrc, rtxSsrc);
 
     auto& bbTransport = barbell.transport;
-    auto* mediaSsrcOutboundContext =
-        obtainOutboundSsrcContext(barbell.idHash, barbell.ssrcOutboundContexts, mediaSsrc, barbell.videoRtpMap);
+    auto* mediaSsrcOutboundContext = obtainOutboundSsrcContext(barbell.idHash,
+        barbell.ssrcOutboundContexts,
+        mediaSsrc,
+        barbell.videoRtpMap,
+        bridge::RtpMap::EMPTY);
     if (!mediaSsrcOutboundContext)
     {
         return;
     }
 
-    auto* rtxSsrcOutboundContext =
-        obtainOutboundSsrcContext(barbell.idHash, barbell.ssrcOutboundContexts, rtxSsrc, barbell.videoFeedbackRtpMap);
+    auto* rtxSsrcOutboundContext = obtainOutboundSsrcContext(barbell.idHash,
+        barbell.ssrcOutboundContexts,
+        rtxSsrc,
+        barbell.videoFeedbackRtpMap,
+        bridge::RtpMap::EMPTY);
 
     if (!rtxSsrcOutboundContext)
     {
@@ -622,6 +630,8 @@ void EngineMixer::processIncomingBarbellFbRtcpPacket(EngineBarbell& barbell,
 
 void EngineMixer::sendUserMediaMapMessageOverBarbells()
 {
+    _lastSendTimeOfUserMediaMapMessageOverBarbells = _lastStartedIterationTimestamp;
+
     if (_engineBarbells.size() == 0)
     {
         return;
@@ -630,14 +640,33 @@ void EngineMixer::sendUserMediaMapMessageOverBarbells()
     utils::StringBuilder<1024> userMediaMapMessage;
     _activeMediaList->makeBarbellUserMediaMapMessage(userMediaMapMessage, _neighbourMemberships);
 
-    if (!_engineBarbells.empty())
-    {
-        logger::debug("send BB msg %s", _loggableId.c_str(), userMediaMapMessage.get());
-    }
+    logger::debug("send BB msg %s", _loggableId.c_str(), userMediaMapMessage.get());
 
     for (auto& barbell : _engineBarbells)
     {
-        barbell.second->dataChannel.sendString(userMediaMapMessage.get(), userMediaMapMessage.getLength());
+        if (barbell.second->dataChannel.isOpen())
+        {
+            barbell.second->dataChannel.sendString(userMediaMapMessage.get(), userMediaMapMessage.getLength());
+        }
+    }
+}
+
+void EngineMixer::sendPeriodicUserMediaMapMessageOverBarbells(const uint64_t engineIterationStartTimestamp)
+{
+    // Send periodic messages over barbell. It can be useful for recovery scenarios where for a period of time
+    // there are more than 1 barbell connection between the same SMB and decommission of the broken barbell streams
+    // can remove the participants from active list.
+    // This is disabled by default and it's possible to be enabled by
+    if (!_engineBarbells.empty() && _config.barbell.userMapPeriodicSendingInterval > 0)
+    {
+        const int64_t interval =
+            static_cast<uint64_t>(_config.barbell.userMapPeriodicSendingInterval) * utils::Time::sec;
+        if (utils::Time::diffGE(_lastSendTimeOfUserMediaMapMessageOverBarbells,
+                engineIterationStartTimestamp,
+                interval))
+        {
+            sendUserMediaMapMessageOverBarbells();
+        }
     }
 }
 
@@ -692,8 +721,11 @@ void EngineMixer::forwardAudioRtpPacketOverBarbell(IncomingPacketInfo& packetInf
         }
         uint32_t ssrc = rewriteMapItr->second;
 
-        auto* ssrcOutboundContext =
-            obtainOutboundSsrcContext(barbell.idHash, barbell.ssrcOutboundContexts, ssrc, barbell.audioRtpMap);
+        auto* ssrcOutboundContext = obtainOutboundSsrcContext(barbell.idHash,
+            barbell.ssrcOutboundContexts,
+            ssrc,
+            barbell.audioRtpMap,
+            bridge::RtpMap::EMPTY);
 
         if (!ssrcOutboundContext)
         {
@@ -751,7 +783,7 @@ void EngineMixer::forwardVideoRtpPacketOverBarbell(IncomingPacketInfo& packetInf
         }
 
         auto* ssrcOutboundContext =
-            obtainOutboundSsrcContext(barbell.idHash, barbell.ssrcOutboundContexts, targetSsrc, barbell.videoRtpMap);
+            obtainOutboundSsrcContext(barbell.idHash, barbell.ssrcOutboundContexts, targetSsrc, barbell.videoRtpMap, bridge::RtpMap::EMPTY);
 
         if (!ssrcOutboundContext)
         {
