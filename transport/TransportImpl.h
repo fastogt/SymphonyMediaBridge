@@ -52,7 +52,8 @@ class TransportImpl : public RtcTransport,
                       public sctp::SctpServerPort::IEvents,
                       public sctp::SctpAssociation::IEvents,
                       public ServerEndpoint::IEvents,
-                      private RtcpReportProducer::RtcpSender
+                      private RtcpReportProducer::RtcpSender,
+                      private Endpoint::IStopEvents
 {
 public:
     TransportImpl(jobmanager::JobManager& jobmanager,
@@ -202,6 +203,9 @@ private: // SslWriteBioListener
     void onIceCandidateChanged(ice::IceSession* session,
         ice::IceEndpoint* endpoint,
         const SocketAddress& sourcePort) override;
+    void onIceCandidateAccepted(ice::IceSession* session,
+        ice::IceEndpoint* localEndpoint,
+        const ice::IceCandidate& remoteCandidate) override;
     void onIceDiscardCandidate(ice::IceSession* session,
         ice::IceEndpoint* endpoint,
         const transport::SocketAddress& sourcePort) override;
@@ -235,6 +239,8 @@ private: // SslWriteBioListener
         uint64_t timestamp) override;
 
     void onTcpDisconnect(Endpoint& endpoint) override;
+    void onEndpointStopped(Endpoint* endpoint) override;
+    void onTcpEndpointStoppedInternal(Endpoint* endpoint);
 
     void onIceTcpConnect(std::shared_ptr<Endpoint> endpoint,
         const SocketAddress& source,

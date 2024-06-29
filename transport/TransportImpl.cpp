@@ -33,7 +33,6 @@
 #else
 #define RTP_LOG(fmt, ...)
 #endif
-
 namespace transport
 {
 constexpr uint32_t Mbps100 = 100000;
@@ -1076,22 +1075,10 @@ void TransportImpl::internalIceReceived(Endpoint& endpoint,
     auto dataReceiver = _dataReceiver.load();
     if (_rtpIceSession->isAttached(&endpoint))
     {
-        if (ice::isResponse(packet->get()) && _rtpIceSession->isResponseAuthentic(packet->get(), packet->getLength()))
-        {
-        }
-        else if (ice::isRequest(packet->get()) &&
-            _rtpIceSession->isRequestAuthentic(packet->get(), packet->getLength()))
-        {
-        }
-        else
+        if (!_rtpIceSession->isIceAuthentic(packet->get(), packet->getLength()))
         {
             // TODO attack, add metric for this
             return;
-        }
-
-        if (_rtpIceSession->canAcceptNewRemoteCandidate(timestamp, source))
-        {
-            endpoint.registerListener(source, this);
         }
 
         auto timeout = _rtpIceSession->nextTimeout(timestamp);
@@ -1112,10 +1099,15 @@ void TransportImpl::internalIceReceived(Endpoint& endpoint,
     }
     else if (_rtpIceSession && endpoint.getTransportType() == ice::TransportType::TCP)
     {
-        _rtpIceSession->onStunPacketReceived(&endpoint, source, packet->get(), packet->getLength(), timestamp);
-        if (dataReceiver)
+        // It is possible that a ice packet has been enqueued while we were discarding TCP candidates.
+        // Check if it CONNECTED to avoid IceSession to store a reference that will be dangling soon
+        if (Endpoint::State::CONNECTED == endpoint.getState())
         {
-            dataReceiver->onIceReceived(this, timestamp);
+            _rtpIceSession->onStunPacketReceived(&endpoint, source, packet->get(), packet->getLength(), timestamp);
+            if (dataReceiver)
+            {
+                dataReceiver->onIceReceived(this, timestamp);
+            }
         }
     }
 }
@@ -1123,6 +1115,26 @@ void TransportImpl::internalIceReceived(Endpoint& endpoint,
 void TransportImpl::onTcpDisconnect(Endpoint& endpoint)
 {
     _jobQueue.post([&]() { _rtpIceSession->onTcpDisconnect(&endpoint); });
+}
+
+void TransportImpl::onEndpointStopped(Endpoint* endpoint)
+{
+    _jobQueue.post(utils::bind(&TransportImpl::onTcpEndpointStoppedInternal, this, endpoint));
+}
+
+void TransportImpl::onTcpEndpointStoppedInternal(Endpoint* endpoint)
+{
+    auto it = std::find_if(_rtpEndpoints.begin(), _rtpEndpoints.end(), [endpoint](const auto& ep) {
+        return static_cast<const transport::Endpoint*>(ep.get()) == endpoint;
+    });
+
+    if (it != _rtpEndpoints.end())
+    {
+        std::iter_swap(it, std::prev(_rtpEndpoints.end()));
+        _rtpEndpoints.pop_back();
+    }
+
+    --_jobCounter;
 }
 
 namespace
@@ -1857,6 +1869,7 @@ bool TransportImpl::setRemotePeer(const SocketAddress& target)
     {
         endpoint->registerListener(_peerRtpPort, this);
     }
+
     for (auto& endpoint : _rtcpEndpoints)
     {
         endpoint->registerListener(_peerRtcpPort, this);
@@ -1922,7 +1935,7 @@ void TransportImpl::doSetRemoteIce(const memory::AudioPacket& credentialPacket,
                     endpoint->registerDefaultListener(this);
                     _rtpEndpoints.push_back(endpoint);
 
-                    _rtpIceSession->addRemoteCandidate(candidate, endpoint.get());
+                    _rtpIceSession->addRemoteTcpPassiveCandidate(candidate, endpoint.get());
                 }
             }
         }
@@ -1979,8 +1992,8 @@ void TransportImpl::onIceCandidateChanged(ice::IceSession* session,
             _loggableId.c_str(),
             endpoint->getLocalPort().getFamilyString().c_str(),
             ice::toString(endpoint->getTransportType()).c_str(),
-            endpoint->getLocalPort().toString().c_str(),
-            sourcePort.toString().c_str());
+            endpoint->getLocalPort().toFixedString().c_str(),
+            maybeMasked(sourcePort).c_str());
 
         if (_srtpClient->getState() == SrtpClient::State::READY)
         {
@@ -2001,8 +2014,8 @@ void TransportImpl::onIceCandidateChanged(ice::IceSession* session,
             _loggableId.c_str(),
             endpoint->getLocalPort().getFamilyString().c_str(),
             ice::toString(endpoint->getTransportType()).c_str(),
-            endpoint->getLocalPort().toString().c_str(),
-            sourcePort.toString().c_str());
+            endpoint->getLocalPort().toFixedString().c_str(),
+            maybeMasked(sourcePort).c_str());
     }
 }
 
@@ -2030,8 +2043,8 @@ void TransportImpl::onIceStateChanged(ice::IceSession* session, const ice::IceSe
 
         logger::info("Pair selected: %s - %s  rtt:%" PRIu64 "us",
             _loggableId.c_str(),
-            candidatePair.first.address.toString().c_str(),
-            candidatePair.second.address.toString().c_str(),
+            candidatePair.first.address.toFixedString().c_str(),
+            maybeMasked(candidatePair.second.address).c_str(),
             rtt / utils::Time::us);
 
         if (_selectedRtp)
@@ -2050,25 +2063,20 @@ void TransportImpl::onIceStateChanged(ice::IceSession* session, const ice::IceSe
 
         if (_rtpIceSession->getRole() == ice::IceRole::CONTROLLING)
         {
-            while (!_rtpEndpoints.empty() && _rtpEndpoints.back().get() != _selectedRtp &&
-                _rtpEndpoints.back()->getTransportType() == ice::TransportType::TCP)
+            for (auto& endpoint : _rtpEndpoints)
             {
-                logger::info("discarding %s, ref %ld",
-                    _loggableId.c_str(),
-                    _rtpEndpoints.back()->getName(),
-                    _rtpEndpoints.back().use_count());
-                _rtpIceSession->onTcpRemoved(_rtpEndpoints.back().get());
-                _rtpEndpoints.back()->unregisterListener(this);
+                if (endpoint.get() != _selectedRtp && endpoint->getTransportType() == ice::TransportType::TCP)
+                {
+                    logger::info("discarding %s, ref %ld",
+                        _loggableId.c_str(),
+                        endpoint->getName(),
+                        endpoint.use_count());
 
-                _rtpEndpoints.pop_back();
-            }
-            while (!_rtpEndpoints.empty() && _rtpEndpoints.front().get() != _selectedRtp &&
-                _rtpEndpoints.front()->getTransportType() == ice::TransportType::TCP)
-            {
-                logger::info("discarding %s", _loggableId.c_str(), _rtpEndpoints.front()->getName());
-                _rtpIceSession->onTcpRemoved(_rtpEndpoints.front().get());
-                _rtpEndpoints.front()->unregisterListener(this);
-                _rtpEndpoints.erase(_rtpEndpoints.begin());
+                    _rtpIceSession->onTcpRemoved(endpoint.get());
+                    endpoint->unregisterListener(this);
+                    ++_jobCounter;
+                    endpoint->stop(this);
+                }
             }
         }
 
@@ -2434,13 +2442,62 @@ void TransportImpl::setTag(const char* tag)
     utils::strncpy(_tag, tag, sizeof(_tag));
 }
 
+void TransportImpl::onIceCandidateAccepted(ice::IceSession* session,
+    ice::IceEndpoint* endpoint,
+    const ice::IceCandidate& remoteCandidate)
+{
+    logger::info("candidate accepted: %s %s, %s - %s",
+        _loggableId.c_str(),
+        endpoint->getLocalPort().getFamilyString().c_str(),
+        ice::toString(endpoint->getTransportType()).c_str(),
+        endpoint->getLocalPort().toFixedString().c_str(),
+        maybeMasked(remoteCandidate.address).c_str());
+
+    for (auto& udpEndpoint : _rtpEndpoints)
+    {
+        // static cast for type safe raw pointer comparison
+        if (endpoint == static_cast<ice::IceEndpoint*>(udpEndpoint.get()))
+        {
+            udpEndpoint->registerListener(remoteCandidate.address, this);
+            return;
+        }
+    }
+
+    for (auto& udpEndpoint : _rtpEndpoints)
+    {
+        if (endpoint == static_cast<ice::IceEndpoint*>(udpEndpoint.get()))
+        {
+            udpEndpoint->registerListener(remoteCandidate.address, this);
+            return;
+        }
+    }
+
+    logger::error("Not possible to register listener as the endpoint was not found: %s %s, %s - %s",
+        _loggableId.c_str(),
+        endpoint->getLocalPort().getFamilyString().c_str(),
+        ice::toString(endpoint->getTransportType()).c_str(),
+        endpoint->getLocalPort().toString().c_str(),
+        remoteCandidate.address.toString().c_str());
+}
+
 void TransportImpl::onIceDiscardCandidate(ice::IceSession* session,
     ice::IceEndpoint* endpoint,
     const transport::SocketAddress& sourcePort)
 {
+    if (session->getState() <= ice::IceSession::State::CONNECTED)
+    {
+        logger::info("candidate discarded: %s %s, %s - %s",
+            _loggableId.c_str(),
+            endpoint->getLocalPort().getFamilyString().c_str(),
+            ice::toString(endpoint->getTransportType()).c_str(),
+            endpoint->getLocalPort().toFixedString().c_str(),
+            maybeMasked(sourcePort).c_str());
+    }
+
     for (auto& udpEndpoint : _rtpEndpoints)
     {
-        if (endpoint == udpEndpoint.get())
+        // static cast for type safe raw pointer comparison
+        if (endpoint == static_cast<ice::IceEndpoint*>(udpEndpoint.get()))
         {
             udpEndpoint->unregisterListener(sourcePort, this);
             return;
@@ -2449,7 +2506,7 @@ void TransportImpl::onIceDiscardCandidate(ice::IceSession* session,
 
     for (auto& udpEndpoint : _rtcpEndpoints)
     {
-        if (endpoint == udpEndpoint.get())
+        if (endpoint == static_cast<ice::IceEndpoint*>(udpEndpoint.get()))
         {
             udpEndpoint->unregisterListener(sourcePort, this);
             return;
